@@ -24,6 +24,111 @@ from cosmos_predict1.diffusion.inference.forward_warp_utils_pytorch import (
 )
 from cosmos_predict1.diffusion.inference.camera_utils import align_depth
 
+
+from pytorch3d.renderer import (
+    PerspectiveCameras, 
+    PointsRasterizer, 
+    PointsRasterizationSettings, 
+    PointsRenderer, 
+    AlphaCompositor,
+    NormWeightedCompositor
+)
+from pytorch3d.structures import Pointclouds
+
+
+def render_pointcloud_image(
+    view_cameras_R_w2cs_pytorch3d: torch.Tensor, # [1, 3, 3]
+    view_cameras_T_w2cs_pytorch3d: torch.Tensor, # [1, 3]
+    view_cameras_focal_length: torch.Tensor, # [1, 2]
+    view_cameras_principal_points: torch.Tensor, # [1, 2]
+    points: torch.Tensor, # [N, 3]
+    colors_with_alpha: torch.Tensor, # [N, 4]
+    image_width: int = 1024,
+    image_height: int = 704,
+    device="cuda"
+):
+    radius_in_pixels = 1.5
+    points_per_pixel = 32
+    radius_ndc = 2.0 * radius_in_pixels / float(max(image_width, image_height))
+
+    background_color_rgb = (0.0, 0.0, 0.0)
+
+    compositor_type = "normal"
+    if compositor_type == "alpha":
+        compositor = AlphaCompositor(background_color=torch.tensor(background_color_rgb, device=device))
+    else:
+        compositor = NormWeightedCompositor(background_color=torch.tensor(background_color_rgb, device=device))
+
+
+
+    # Distinct focal lengths in pixels; principal point in pixels; image size in pixels
+    cameras = PerspectiveCameras(
+        # focal_length=torch.tensor((fx, fy), device=device).unsqueeze(0),
+        focal_length=view_cameras_focal_length,
+        # principal_point=torch.tensor((cx, cy), device=device).unsqueeze(0),
+        principal_point=view_cameras_principal_points,
+        image_size=torch.tensor((image_height, image_width), device=device).expand(view_cameras_focal_length.shape[0], -1),  # enables screen-space parameterization
+        # R=camera_R_w2c.unsqueeze(0), T=camera_T_w2c.unsqueeze(0), 
+        R = view_cameras_R_w2cs_pytorch3d,
+        T = view_cameras_T_w2cs_pytorch3d,
+        # R=R, T=T,
+        in_ndc=False,
+        device=device
+    )
+
+
+    rasterizer = PointsRasterizer(
+        cameras=cameras,
+        raster_settings=PointsRasterizationSettings(
+            image_size=(image_height, image_width),
+            radius=radius_ndc,
+            points_per_pixel = points_per_pixel,
+            bin_size=64
+        )
+    )
+
+    # print(rasterizer)
+    renderer = PointsRenderer(rasterizer=rasterizer, compositor=compositor)
+
+    point_cloud = Pointclouds(
+        # points=[points.clone() for _ in range(constrain_indices)],
+        # features=[colors_with_alpha.clone() for _ in range(constrain_indices)],
+        points = [points],
+        features=[colors_with_alpha]
+    )
+
+    # images = renderer(point_cloud)
+    images = renderer(point_cloud).clamp(0.0, 1.0)  # (N,H,W,3) float
+    images_uint8 = (images * 255.0 + 0.5).to(torch.uint8)
+
+    # return images
+    # 
+
+
+    # Fragments for coverage / masks / depth
+    fragments = rasterizer(point_cloud)  # idx,zbuf,dists: (N,H,W,K)
+    nearest_point_index = fragments.idx[..., 0]     # (N,H,W), -1 where empty
+    cover_mask = nearest_point_index >= 0           # True where at least one point splatted
+    holes_mask = ~cover_mask
+
+    # Optional soft coverage confidence in [0,1]
+    dists_squared = fragments.dists                  # (N,H,W,K)
+    soft_coverage = (1.0 - dists_squared / (radius_ndc * radius_ndc)).clamp(min=0.0, max=1.0).max(dim=-1).values
+    soft_coverage = torch.where(cover_mask, soft_coverage, torch.zeros_like(soft_coverage))
+
+    # Optional first-hit view-space depth (NaN where holes)
+    depth_view_z = fragments.zbuf[..., 0]
+    depth_view_z = torch.where(cover_mask, depth_view_z, torch.full_like(depth_view_z, float("nan")))
+
+    return {
+        "rgb_composited_uint8": images_uint8,  # (N,H,W,3)
+        "cover_mask": cover_mask,              # (N,H,W) bool
+        "holes_mask": holes_mask,              # (N,H,W) bool
+        "soft_coverage": soft_coverage,        # (N,H,W) float32
+        "depth_view_z": depth_view_z,          # (N,H,W) float32 (NaN where invalid)
+    }
+
+
 class Cache3D_Base:
     def __init__(
         self,
@@ -159,6 +264,96 @@ class Cache3D_Base:
     def input_frame_count(self) -> int:
         return self.input_image.shape[1]
 
+    # def render_cache(self, target_w2cs, target_intrinsics, render_depth=False, start_frame_idx=0):
+    #     bs, F_target, _, _ = target_w2cs.shape
+
+    #     B, F, N, V, C, H, W = self.input_image.shape
+    #     assert bs == B
+
+
+    #     # (B*F*N), 4, 4
+    #     target_w2cs = target_w2cs.reshape(B, F_target, 1, 4, 4).expand(B, F_target, N, 4, 4).reshape(-1, 4, 4)
+
+    #     # (B*F*N), 3, 3
+    #     target_intrinsics = (
+    #         target_intrinsics.reshape(B, F_target, 1, 3, 3).expand(B, F_target, N, 3, 3).reshape(-1, 3, 3)
+    #     )
+
+    #     first_images = rearrange(self.input_image[:, start_frame_idx:start_frame_idx+F_target].expand(B, F_target, N, V, C, H, W), "B F N V C H W-> (B F N) V C H W").to(self.device)
+    #     first_points = rearrange(
+    #         self.input_points[:, start_frame_idx:start_frame_idx+F_target].expand(B, F_target, N, V, H, W, 3), "B F N V H W C-> (B F N) V H W C"
+    #     ).to(self.device)
+    #     first_masks = rearrange(
+    #         self.input_mask[:, start_frame_idx:start_frame_idx+F_target].expand(B, F_target, N, V, 1, H, W), "B F N V C H W-> (B F N) V C H W"
+    #     ).to(self.device) if self.input_mask is not None else None
+    #     boundary_masks = rearrange(
+    #         self.boundary_mask.expand(B, F_target, N, V, 1, H, W), "B F N V C H W-> (B F N) V C H W"
+    #     ) if self.boundary_mask is not None else None
+
+    #     if first_images.shape[1] == 1:
+    #         # warp_chunk_size = 2 # number of images to warp at once. In this case 2. These 2 images are independent from each other!!!
+    #         warp_chunk_size = 32 # number of images to warp at once. In this case 2. These 2 images are independent from each other!!!
+    #         # warp_chunk_size = 4
+    #         # warp_chunk_size = 16
+    #         rendered_warp_images = []
+    #         rendered_warp_masks = []
+    #         rendered_warp_depth = []
+    #         rendered_warped_flows = []
+            
+
+    #         first_images = first_images.squeeze(1)
+    #         first_points = first_points.squeeze(1)
+    #         first_masks = first_masks.squeeze(1) if first_masks is not None else None
+
+    #         # Render for all target w2cs/intrinsics 
+    #         for i in tqdm(range(0, first_images.shape[0], warp_chunk_size), desc="Rendering cache"):
+
+    #             #  warp_chunk_size 
+    #             # Number of images to warp at once. In this case 2. 
+    #             # These 2 images are independent from each other!!!
+
+    #             (
+    #                 rendered_warp_images_chunk, # [warp_chunk_size=2, 3, H, W]
+    #                 rendered_warp_masks_chunk, # [warp_chunk_size=2, 1, H, W]
+    #                 rendered_warp_depth_chunk, # [warp_chunk_size=2, H, W] if render_depth else None
+    #                 rendered_warped_flows_chunk, # [warp_chunk_size=2, 2, H, W]
+    #             ) = forward_warp(
+    #                 first_images[i : i + warp_chunk_size],
+    #                 mask1=first_masks[i : i + warp_chunk_size] if first_masks is not None else None,
+    #                 depth1=None,
+    #                 transformation1=None,
+    #                 transformation2=target_w2cs[i : i + warp_chunk_size],
+    #                 intrinsic1=target_intrinsics[i : i + warp_chunk_size],
+    #                 intrinsic2=target_intrinsics[i : i + warp_chunk_size],
+    #                 render_depth=render_depth,
+    #                 world_points1=first_points[i : i + warp_chunk_size],
+    #                 foreground_masking=self.foreground_masking,
+    #                 boundary_mask=boundary_masks[i : i + warp_chunk_size, 0, 0] if boundary_masks is not None else None
+    #             )
+    #             rendered_warp_images.append(rendered_warp_images_chunk)
+    #             rendered_warp_masks.append(rendered_warp_masks_chunk)
+    #             rendered_warp_depth.append(rendered_warp_depth_chunk)
+    #             rendered_warped_flows.append(rendered_warped_flows_chunk)
+
+    #             # delete rendered_warp_images_chunk, rendered_warp_masks_chunk, rendered_warp_depth_chunk, rendered_warped_flows_chunk
+    #             del rendered_warp_images_chunk, rendered_warp_masks_chunk, rendered_warp_depth_chunk
+    #             del rendered_warped_flows_chunk
+    #         rendered_warp_images = torch.cat(rendered_warp_images, dim=0)
+    #         rendered_warp_masks = torch.cat(rendered_warp_masks, dim=0)
+    #         if render_depth:
+    #             rendered_warp_depth = torch.cat(rendered_warp_depth, dim=0)
+    #         rendered_warped_flows = torch.cat(rendered_warped_flows, dim=0)
+
+    #     else:
+    #         raise NotImplementedError
+
+    #     pixels = rearrange(rendered_warp_images, "(b f n) c h w -> b f n c h w", b=bs, f=F_target, n=N)
+    #     masks = rearrange(rendered_warp_masks, "(b f n) c h w -> b f n c h w", b=bs, f=F_target, n=N)
+    #     if render_depth:
+    #         pixels = rearrange(rendered_warp_depth, "(b f n) h w -> b f n h w", b=bs, f=F_target, n=N)
+    #     return pixels, masks
+
+
     def render_cache(self, target_w2cs, target_intrinsics, render_depth=False, start_frame_idx=0):
         bs, F_target, _, _ = target_w2cs.shape
 
@@ -166,86 +361,83 @@ class Cache3D_Base:
         assert bs == B
 
 
-        # (B*F*N), 4, 4
-        target_w2cs = target_w2cs.reshape(B, F_target, 1, 4, 4).expand(B, F_target, N, 4, 4).reshape(-1, 4, 4)
+        opencv_to_pytorch3d = torch.diag(torch.as_tensor([-1, -1, 1, 1.0])).to("cuda")
+        view_camera_intrinsics = target_intrinsics
+        view_cameras_w2cs_pytorch3d = opencv_to_pytorch3d @ target_w2cs
 
-        # (B*F*N), 3, 3
-        target_intrinsics = (
-            target_intrinsics.reshape(B, F_target, 1, 3, 3).expand(B, F_target, N, 3, 3).reshape(-1, 3, 3)
-        )
 
-        first_images = rearrange(self.input_image[:, start_frame_idx:start_frame_idx+F_target].expand(B, F_target, N, V, C, H, W), "B F N V C H W-> (B F N) V C H W").to(self.device)
-        first_points = rearrange(
-            self.input_points[:, start_frame_idx:start_frame_idx+F_target].expand(B, F_target, N, V, H, W, 3), "B F N V H W C-> (B F N) V H W C"
-        ).to(self.device)
-        first_masks = rearrange(
-            self.input_mask[:, start_frame_idx:start_frame_idx+F_target].expand(B, F_target, N, V, 1, H, W), "B F N V C H W-> (B F N) V C H W"
-        ).to(self.device) if self.input_mask is not None else None
-        boundary_masks = rearrange(
-            self.boundary_mask.expand(B, F_target, N, V, 1, H, W), "B F N V C H W-> (B F N) V C H W"
-        ) if self.boundary_mask is not None else None
+        view_cameras_R_w2cs_pytorch3d = view_cameras_w2cs_pytorch3d[0, :, :3, :3]
+        view_cameras_T_w2cs_pytorch3d = view_cameras_w2cs_pytorch3d[0, :, :3, 3]
 
-        if first_images.shape[1] == 1:
-            # warp_chunk_size = 2 # number of images to warp at once. In this case 2. These 2 images are independent from each other!!!
-            warp_chunk_size = 32 # number of images to warp at once. In this case 2. These 2 images are independent from each other!!!
-            # warp_chunk_size = 4
-            # warp_chunk_size = 16
-            rendered_warp_images = []
-            rendered_warp_masks = []
-            rendered_warp_depth = []
-            rendered_warped_flows = []
-            
+        view_cameras_fx = view_camera_intrinsics[0, :, 0,0]
+        view_cameras_fy = view_camera_intrinsics[0, :, 1,1]
+        view_cameras_cx = view_camera_intrinsics[0, :, 0,2]
+        view_cameras_cy = view_camera_intrinsics[0, :, 1,2]
 
-            first_images = first_images.squeeze(1)
-            first_points = first_points.squeeze(1)
-            first_masks = first_masks.squeeze(1) if first_masks is not None else None
 
-            # Render for all target w2cs/intrinsics 
-            for i in tqdm(range(0, first_images.shape[0], warp_chunk_size), desc="Rendering cache"):
+        view_cameras_focal_length = torch.stack([view_cameras_fx, view_cameras_fy], dim=1)
+        view_cameras_principal_points = torch.stack([view_cameras_cx, view_cameras_cy], dim=1)
 
-                #  warp_chunk_size 
-                # Number of images to warp at once. In this case 2. 
-                # These 2 images are independent from each other!!!
+        # view_cameras_focal_length = view_cameras_focal_length[:F]
+        # view_cameras_principal_points = view_cameras_principal_points[:F]
 
-                (
-                    rendered_warp_images_chunk, # [warp_chunk_size=2, 3, H, W]
-                    rendered_warp_masks_chunk, # [warp_chunk_size=2, 1, H, W]
-                    rendered_warp_depth_chunk, # [warp_chunk_size=2, H, W] if render_depth else None
-                    rendered_warped_flows_chunk, # [warp_chunk_size=2, 2, H, W]
-                ) = forward_warp(
-                    first_images[i : i + warp_chunk_size],
-                    mask1=first_masks[i : i + warp_chunk_size] if first_masks is not None else None,
-                    depth1=None,
-                    transformation1=None,
-                    transformation2=target_w2cs[i : i + warp_chunk_size],
-                    intrinsic1=target_intrinsics[i : i + warp_chunk_size],
-                    intrinsic2=target_intrinsics[i : i + warp_chunk_size],
-                    render_depth=render_depth,
-                    world_points1=first_points[i : i + warp_chunk_size],
-                    foreground_masking=self.foreground_masking,
-                    boundary_mask=boundary_masks[i : i + warp_chunk_size, 0, 0] if boundary_masks is not None else None
-                )
-                rendered_warp_images.append(rendered_warp_images_chunk)
-                rendered_warp_masks.append(rendered_warp_masks_chunk)
-                rendered_warp_depth.append(rendered_warp_depth_chunk)
-                rendered_warped_flows.append(rendered_warped_flows_chunk)
 
-                # delete rendered_warp_images_chunk, rendered_warp_masks_chunk, rendered_warp_depth_chunk, rendered_warped_flows_chunk
-                del rendered_warp_images_chunk, rendered_warp_masks_chunk, rendered_warp_depth_chunk
-                del rendered_warped_flows_chunk
-            rendered_warp_images = torch.cat(rendered_warp_images, dim=0)
-            rendered_warp_masks = torch.cat(rendered_warp_masks, dim=0)
-            if render_depth:
-                rendered_warp_depth = torch.cat(rendered_warp_depth, dim=0)
-            rendered_warped_flows = torch.cat(rendered_warped_flows, dim=0)
+        # 
+    
+        point_tensor = self.input_points
+        color_tensor = self.input_image
+        point_tensor = point_tensor.contiguous()
+        color_tensor = color_tensor.contiguous()
 
-        else:
-            raise NotImplementedError
+        batch_size, frame_count, buffer_count, view_count, height, width, _ = point_tensor.shape
+        total_pixels = batch_size * frame_count * buffer_count * view_count * height * width
 
-        pixels = rearrange(rendered_warp_images, "(b f n) c h w -> b f n c h w", b=bs, f=F_target, n=N)
-        masks = rearrange(rendered_warp_masks, "(b f n) c h w -> b f n c h w", b=bs, f=F_target, n=N)
-        if render_depth:
-            pixels = rearrange(rendered_warp_depth, "(b f n) h w -> b f n h w", b=bs, f=F_target, n=N)
+        point_coordinates = point_tensor.view(total_pixels, 3)  # (N_total, 3)
+        color_channels_first = color_tensor.permute(0, 1, 2, 3, 5, 6, 4)  # move C from 5th pos to last
+        # rgb_colors = (color_channels_first * 255.0).clamp(0.0, 255.0).to(torch.uint8).view(total_pixels, 3)
+        rgb_colors = color_channels_first * 0.5 + 0.5
+
+        rgb_colors = rgb_colors.reshape(total_pixels, 3)  # (N_total, 3)
+
+        rgba_colors = torch.cat([rgb_colors, torch.ones((total_pixels, 1), device=rgb_colors.device)], dim=1)
+
+        point_coordinates = point_coordinates.to(self.device)
+        rgba_colors = rgba_colors.to(self.device)
+
+        pixels_list = []
+        masks_list = []
+
+        for i in tqdm(range(F_target), desc="Render images"):        
+            result_dict = render_pointcloud_image(
+                view_cameras_R_w2cs_pytorch3d=view_cameras_R_w2cs_pytorch3d[i:i+1],
+                view_cameras_T_w2cs_pytorch3d=view_cameras_T_w2cs_pytorch3d[i:i+1],
+                view_cameras_focal_length=view_cameras_focal_length[i:i+1],
+                view_cameras_principal_points=view_cameras_principal_points[i:i+1],
+                image_width=W,
+                image_height=H,
+                points=point_coordinates,
+                colors_with_alpha=rgba_colors
+            )
+            # import pdb; pdb.set_trace()
+
+
+            pixels_0_1 = result_dict["rgb_composited_uint8"][0, ..., :3] / 255.0
+            pixels_minus_1_plus_1 = pixels_0_1 * 2.0 - 1.0
+
+            mask_single = result_dict["cover_mask"][0]
+
+            pixels_list.append(pixels_minus_1_plus_1)
+            masks_list.append(mask_single)
+
+        # import pdb; pdb.set_trace()
+        # stack
+        pixels = torch.stack(pixels_list, dim=0)
+        masks = torch.stack(masks_list, dim=0)
+
+        # b f n c h w
+        pixels = pixels.permute(0, 3, 1, 2).unsqueeze(0).unsqueeze(2)
+        masks = masks.unsqueeze(-1).permute(0, 3, 1, 2).unsqueeze(0).unsqueeze(2)
+
         return pixels, masks
 
 
