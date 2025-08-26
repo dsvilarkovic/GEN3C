@@ -476,6 +476,11 @@ class Gen3cPersistentModel():
             rendered_warp_image = rendered_warp_image.astype(np.uint8)
             rendered_warp_image = np.transpose(rendered_warp_image, (0, 2, 3, 1))
 
+
+            rendered_warp_mask = rendered_warp_masks[:, :, j, ...].cpu().numpy().squeeze(0)
+            # rendered_warp_mask = 
+            rendered_warp_mask = np.transpose(rendered_warp_mask, (0, 2, 3, 1))
+
             # Save each view as a separate video
             view_video_path = os.path.join(rendered_warps_folder, f"view_{j:04d}.mp4")
             log.info(f"Saving rendered warp view {j:04d} to {view_video_path}")
@@ -483,6 +488,19 @@ class Gen3cPersistentModel():
                 video=rendered_warp_image,
                 fps=self.pipeline.fps,
                 video_save_path=view_video_path,
+                video_save_quality=5,
+                H=self.H,
+                W=self.W,
+            )
+
+            view_mask_video_path = os.path.join(rendered_warps_folder, f"view_{j:04d}_mask.mp4")
+            log.info(f"Saving rendered mask view {j:04d} to {view_mask_video_path}")
+
+            # import pdb; pdb.set_trace()
+            save_video(
+                video=(rendered_warp_mask * 255.0).astype(np.uint8),
+                fps=self.pipeline.fps,
+                video_save_path=view_mask_video_path,
                 video_save_quality=5,
                 H=self.H,
                 W=self.W,
