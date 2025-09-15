@@ -23,7 +23,9 @@ from cosmos_predict1.diffusion.inference.forward_warp_utils_pytorch import (
     unproject_points,
 )
 from cosmos_predict1.diffusion.inference.camera_utils import align_depth
-
+from memory_utils import print_vram_usage, get_string_vram_usage
+from cosmos_predict1.utils.log import logger
+ 
 class Cache3D_Base:
     def __init__(
         self,
@@ -174,16 +176,31 @@ class Cache3D_Base:
             target_intrinsics.reshape(B, F_target, 1, 3, 3).expand(B, F_target, N, 3, 3).reshape(-1, 3, 3)
         )
 
-        first_images = rearrange(self.input_image[:, start_frame_idx:start_frame_idx+F_target].expand(B, F_target, N, V, C, H, W), "B F N V C H W-> (B F N) V C H W").to(self.device)
+        logger.info(f"Before rearranging input images {get_string_vram_usage()}")
+        # first_images = rearrange(self.input_image[:, start_frame_idx:start_frame_idx+F_target].expand(B, F_target, N, V, C, H, W), "B F N V C H W-> (B F N) V C H W").to(self.device)
+        first_images = rearrange(self.input_image[:, start_frame_idx:start_frame_idx+F_target].expand(B, F_target, N, V, C, H, W), "B F N V C H W-> (B F N) V C H W") #.to(self.device)
+        logger.info(f"Before rearranging input_points {get_string_vram_usage()}")
+        # first_points = rearrange(
+        #     self.input_points[:, start_frame_idx:start_frame_idx+F_target].expand(B, F_target, N, V, H, W, 3), "B F N V H W C-> (B F N) V H W C"
+        # ).to(self.device)
         first_points = rearrange(
             self.input_points[:, start_frame_idx:start_frame_idx+F_target].expand(B, F_target, N, V, H, W, 3), "B F N V H W C-> (B F N) V H W C"
-        ).to(self.device)
+        ) #.to(self.device)
+
+        logger.info(f"Before rearranging input masks {get_string_vram_usage()}")
+        # first_masks = rearrange(
+            # self.input_mask[:, start_frame_idx:start_frame_idx+F_target].expand(B, F_target, N, V, 1, H, W), "B F N V C H W-> (B F N) V C H W"
+        # ).to(self.device) if self.input_mask is not None else None
         first_masks = rearrange(
             self.input_mask[:, start_frame_idx:start_frame_idx+F_target].expand(B, F_target, N, V, 1, H, W), "B F N V C H W-> (B F N) V C H W"
-        ).to(self.device) if self.input_mask is not None else None
+        ) if self.input_mask is not None else None
+
+        logger.info(f"Before rearranging boundary masks {get_string_vram_usage()}")
         boundary_masks = rearrange(
             self.boundary_mask.expand(B, F_target, N, V, 1, H, W), "B F N V C H W-> (B F N) V C H W"
         ) if self.boundary_mask is not None else None
+
+        logger.info(f"{get_string_vram_usage()}")
 
         if first_images.shape[1] == 1:
             # warp_chunk_size = 2 # number of images to warp at once. In this case 2. These 2 images are independent from each other!!!
@@ -201,11 +218,26 @@ class Cache3D_Base:
             first_masks = first_masks.squeeze(1) if first_masks is not None else None
 
             # Render for all target w2cs/intrinsics 
-            for i in tqdm(range(0, first_images.shape[0], warp_chunk_size), desc="Rendering cache"):
+            pbar = tqdm(range(0, first_images.shape[0], warp_chunk_size), desc="Rendering cache")
+            for i in pbar:
 
                 #  warp_chunk_size 
                 # Number of images to warp at once. In this case 2. 
                 # These 2 images are independent from each other!!!
+
+                # import pdb; pdb.set_trace()
+                imgs_chunk = first_images[i : i + warp_chunk_size].to(self.device, non_blocking=True)
+                pts_chunk = first_points[i : i + warp_chunk_size].to(self.device, non_blocking=True)
+                masks_chunk = (
+                    first_masks[i : i + warp_chunk_size].to(self.device, non_blocking=True)
+                    if first_masks is not None
+                    else None
+                )
+                bmask_chunk = (
+                    boundary_masks[i : i + warp_chunk_size, 0, 0].to(self.device, non_blocking=True)
+                    if boundary_masks is not None
+                    else None
+                )
 
                 (
                     rendered_warp_images_chunk, # [warp_chunk_size=2, 3, H, W]
@@ -213,27 +245,43 @@ class Cache3D_Base:
                     rendered_warp_depth_chunk, # [warp_chunk_size=2, H, W] if render_depth else None
                     rendered_warped_flows_chunk, # [warp_chunk_size=2, 2, H, W]
                 ) = forward_warp(
-                    first_images[i : i + warp_chunk_size],
-                    mask1=first_masks[i : i + warp_chunk_size] if first_masks is not None else None,
+                    # first_images[i : i + warp_chunk_size].to(self.device),
+                    imgs_chunk,
+                    # mask1=first_masks[i : i + warp_chunk_size].to(self.device) if first_masks is not None else None,
+                    mask1=masks_chunk,
                     depth1=None,
                     transformation1=None,
                     transformation2=target_w2cs[i : i + warp_chunk_size],
                     intrinsic1=target_intrinsics[i : i + warp_chunk_size],
                     intrinsic2=target_intrinsics[i : i + warp_chunk_size],
                     render_depth=render_depth,
-                    world_points1=first_points[i : i + warp_chunk_size],
+                    # world_points1=first_points[i : i + warp_chunk_size],
+                    world_points1=pts_chunk,
                     foreground_masking=self.foreground_masking,
-                    boundary_mask=boundary_masks[i : i + warp_chunk_size, 0, 0] if boundary_masks is not None else None
+                    # boundary_mask=boundary_masks[i : i + warp_chunk_size, 0, 0] if boundary_masks is not None else None
+                    boundary_mask=bmask_chunk
                 )
-                rendered_warp_images.append(rendered_warp_images_chunk)
-                rendered_warp_masks.append(rendered_warp_masks_chunk)
-                rendered_warp_depth.append(rendered_warp_depth_chunk)
-                rendered_warped_flows.append(rendered_warped_flows_chunk)
+                # rendered_warp_images.append(rendered_warp_images_chunk)
+                rendered_warp_images.append(rendered_warp_images_chunk.to("cpu"))
+                # rendered_warp_masks.append(rendered_warp_masks_chunk)
+                rendered_warp_masks.append(rendered_warp_masks_chunk.to("cpu"))
+                # rendered_warp_depth.append(rendered_warp_depth_chunk)
+                if render_depth:
+                    rendered_warp_depth.append(rendered_warp_depth_chunk.to("cpu"))
+                # rendered_warped_flows.append(rendered_warped_flows_chunk)
+                rendered_warped_flows.append(rendered_warped_flows_chunk.to("cpu"))
+
 
                 # delete rendered_warp_images_chunk, rendered_warp_masks_chunk, rendered_warp_depth_chunk, rendered_warped_flows_chunk
+                # logger.info(f"{get_string_vram_usage()}")
+                pbar.set_description(f"Rendering cache {i+warp_chunk_size}/{first_images.shape[0]}. {get_string_vram_usage()}")
+                torch.cuda.empty_cache()
                 del rendered_warp_images_chunk, rendered_warp_masks_chunk, rendered_warp_depth_chunk
                 del rendered_warped_flows_chunk
+
+            logger.info(f"Before concatenating rendered_warp_images {get_string_vram_usage()}")
             rendered_warp_images = torch.cat(rendered_warp_images, dim=0)
+            logger.info(f"Before concatenating rendered_warp_masks {get_string_vram_usage()}")
             rendered_warp_masks = torch.cat(rendered_warp_masks, dim=0)
             if render_depth:
                 rendered_warp_depth = torch.cat(rendered_warp_depth, dim=0)
@@ -242,11 +290,15 @@ class Cache3D_Base:
         else:
             raise NotImplementedError
 
+        logger.info(f"Before rendered_warp_images rearangement {get_string_vram_usage()}")
         pixels = rearrange(rendered_warp_images, "(b f n) c h w -> b f n c h w", b=bs, f=F_target, n=N)
+        logger.info(f"After rendered_warp_images rearangement {get_string_vram_usage()}")
         masks = rearrange(rendered_warp_masks, "(b f n) c h w -> b f n c h w", b=bs, f=F_target, n=N)
         if render_depth:
             pixels = rearrange(rendered_warp_depth, "(b f n) h w -> b f n h w", b=bs, f=F_target, n=N)
-        return pixels, masks
+
+        logger.info(f"After rendered_warp_depth rearangement {get_string_vram_usage()}")
+        return pixels.to(self.device), masks.to(self.device)
 
 
 class Cache3D_Buffer(Cache3D_Base):
