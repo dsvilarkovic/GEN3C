@@ -472,7 +472,6 @@ class Gen3cPersistentModel():
                 start_frame_idx=0,
             )
 
-            import pdb; pdb.set_trace()
 
 
         #  Save video of rendered warps

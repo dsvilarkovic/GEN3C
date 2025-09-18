@@ -41,6 +41,11 @@ For business inquiries, please visit our website and submit the form: [NVIDIA Re
 For any other questions related to the model, please contact Xuanchi, Tianchang or Jun.
 
 ## News
+
+- 2025-08-21 We’ve released integration with ViPE for video-to-video generation, along with code for [**multi-view** inference](https://github.com/nv-tlabs/GEN3C?tab=readme-ov-file#example-3-video-generation-from-multiview-images)!
+
+- 2025-08-12 We’ve just released [ViPE](https://github.com/nv-tlabs/vipe) — a data annotation pipeline for jointly predicting depth and camera pose from video. ViPE powers both the training and testing stages of GEN3C!
+
 - 2025-06-06 Code and model released! In a future update, we plan to include the pipeline for jointly predicting depth and camera pose from video, as well as a driving-finetuned model. Stay tuned!
 
 ## Installation
@@ -104,7 +109,7 @@ CUDA_HOME=$CONDA_PREFIX PYTHONPATH=$(pwd) python cosmos_predict1/diffusion/infer
 ```
 
 
-#### Static multiple view support with max pooling 
+#### [Dusan's MultiView support]Static multiple view support with max pooling 
 
 This is a walkaround support for reconstructing a scene from multiple views. Currently only single view is supported. The rest will be in [README_MULTIVIEW.md](README_MULTIVIEW.md).
 
@@ -173,7 +178,7 @@ Maximum observed memory during inference with full offloading: ~43GB. Note: Memo
 
 
 ### Example 2: Video to Video Generation
-For video input, GEN3C requires additional depth information, camera intrinsics, and extrinsics. These can be obtained using your choice of SLAM packages. For testing purposes, we provide example data.
+For video input, GEN3C requires additional depth information, camera intrinsics, and extrinsics. These can be obtained using your choice of SLAM packages. We recommend using [ViPE](https://github.com/nv-tlabs/vipe). For testing purposes, we provide example data.
 
 First, you need to download the test samples:
 ```bash
@@ -200,6 +205,52 @@ CUDA_HOME=$CONDA_PREFIX PYTHONPATH=$(pwd) torchrun --nproc_per_node=${NUM_GPUS} 
     --video_save_name test_dynamic_video_multigpu \
     --num_gpus ${NUM_GPUS} \
     --guidance 1
+```
+
+#### Testing on your own videos using ViPE
+Follow the installation instructions for [ViPE](https://github.com/nv-tlabs/vipe). Note: ViPE's environment is not compatible with GEN3C. We recommend installing ViPE in a separate conda environment.
+
+1) Run ViPE to extract depth, intrinsics, and camera poses:
+```bash
+vipe infer YOUR_VIDEO.mp4 --output <vipe_results_dir>
+```
+
+2) Run GEN3C with the ViPE outputs:
+```bash
+NUM_GPUS=8
+CUDA_HOME=$CONDA_PREFIX PYTHONPATH=$(pwd) torchrun --nproc_per_node=${NUM_GPUS} cosmos_predict1/diffusion/inference/gen3c_dynamic.py \
+    --checkpoint_dir checkpoints \
+    --vipe_path <vipe_results_dir> \
+    --vipe_starting_frame_idx 0 \
+    --video_save_name gen3c_test_dynamic_vipe \
+    --disable_prompt_upsampler \
+    --num_gpus ${NUM_GPUS} \
+    --guidance 1 \
+    --num_video_frames 121
+```
+
+The generated video will span frames from `vipe_starting_frame_idx` to `vipe_starting_frame_idx + num_video_frames - 1` of the original input video. Camera motion is controlled by the options described in "Camera Movement Options" above.
+
+### Example 3: Video Generation from Multiview Images
+Similar to video input, GEN3C requires additional depth information, camera intrinsics, and extrinsics. These can be obtained using off-the-shelf methods like [VGGT](https://github.com/facebookresearch/vggt). For testing purposes, we provide example data.
+
+First, download the test samples:
+```bash
+# Download test samples from Hugging Face
+huggingface-cli download nvidia/GEN3C-Testing-Example --repo-type dataset --local-dir assets/diffusion/dynamic_video_samples
+```
+
+```bash
+NUM_GPUS=8
+CUDA_HOME=$CONDA_PREFIX PYTHONPATH=$(pwd) torchrun --nproc_per_node=${NUM_GPUS} -m cosmos_predict1.diffusion.inference.gen3c_multiview \
+    --checkpoint_dir checkpoints \
+    --video_save_name gen3c_test_multiview \
+    --num_video_frames 361 \
+    --height 704 --width 1280 \
+    --npz_path assets/diffusion/dynamic_video_samples/mv_0.npz \
+    --num_gpus ${NUM_GPUS} \
+    --filter_points_threshold 0.05 \
+    --foreground_masking --guidance 1
 ```
 
 
