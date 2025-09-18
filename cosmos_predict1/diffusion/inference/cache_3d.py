@@ -285,7 +285,6 @@ class Cache3D_Base:
             rendered_warp_masks = torch.cat(rendered_warp_masks, dim=0)
             if render_depth:
                 rendered_warp_depth = torch.cat(rendered_warp_depth, dim=0)
-            rendered_warped_flows = torch.cat(rendered_warped_flows, dim=0)
 
         else:
             raise NotImplementedError
@@ -397,6 +396,8 @@ class Cache3D_Buffer(Cache3D_Base):
         pixels, masks = super().render_cache(
             target_w2cs, target_intrinsics, render_depth
         )
+        pixels = pixels.to(output_device)
+        masks = masks.to(output_device)
         if not render_depth:
             noise = torch.randn(pixels.shape, generator=self.generator, device=pixels.device, dtype=pixels.dtype)
             per_buffer_noise = (
@@ -404,7 +405,85 @@ class Cache3D_Buffer(Cache3D_Base):
                 * self.noise_aug_strength
             )
             pixels = pixels + noise * per_buffer_noise.reshape(1, 1, -1, 1, 1, 1)  # B, F, N, C, H, W
-        return pixels.to(output_device), masks.to(output_device)
+        return pixels, masks
+
+
+class Cache3D_BufferSelector(Cache3D_Base):
+    def __init__(self, frame_buffer_max=1, mask_for_max_buffer_model: bool = True, mask_full_threshold: float = 0.9, **kwargs):
+        """A buffer that holds many initialization frames and selects top-K by overlap per target.
+
+        This class does not support update_cache. It assumes multiple source frames are provided
+        at initialization time via the 'N' (buffer) dimension.
+        """
+        super().__init__(**kwargs)
+        self.frame_buffer_max = max(int(frame_buffer_max), 1)
+        self.mask_for_max_buffer_model = bool(mask_for_max_buffer_model)
+        self.mask_full_threshold = float(mask_full_threshold)
+
+    def update_cache(self, *args, **kwargs): 
+        raise NotImplementedError("Cache3D_BufferSelector does not support update_cache")
+
+    def render_cache(
+        self,
+        target_w2cs,
+        target_intrinsics,
+        render_depth: bool = False,
+        start_frame_idx: int = 0,
+    ):
+        # Warp from all buffer frames first
+        output_device = target_w2cs.device
+        target_w2cs = target_w2cs.to(self.weight_dtype).to(self.device)
+        target_intrinsics = target_intrinsics.to(self.weight_dtype).to(self.device)
+
+        pixels_all, masks_all = super().render_cache(
+            target_w2cs, target_intrinsics, render_depth, start_frame_idx
+        )  # shapes: [B, F, N, C, H, W] (pixels) and [B, F, N, 1, H, W] (masks)
+
+        B, F, N = pixels_all.shape[0], pixels_all.shape[1], pixels_all.shape[2]
+        if N <= self.frame_buffer_max:
+            pixels_sel, masks_sel = pixels_all, masks_all
+        else:
+            # Compute per-buffer overlap score: sum over frames and pixels
+            # masks_all: [B, F, N, 1, H, W]
+            overlap_scores = masks_all.sum(dim=(1, 3, 4, 5))  # -> [B, N]
+
+            # Select top-K for each batch independently
+            k = min(self.frame_buffer_max, N)
+            topk_indices = overlap_scores.topk(k=k, dim=1, largest=True, sorted=True).indices  # [B, k]
+
+            # Gather along N dimension
+            selected_pixels_list = []
+            selected_masks_list = []
+            for b in range(B):
+                idx_b = topk_indices[b]  # [k]
+                selected_pixels_list.append(pixels_all[b : b + 1, :, idx_b])  # [1, F, k, C, H, W]
+                selected_masks_list.append(masks_all[b : b + 1, :, idx_b])    # [1, F, k, 1, H, W]
+
+            pixels_sel = torch.cat(selected_pixels_list, dim=0)
+            masks_sel = torch.cat(selected_masks_list, dim=0)
+        if self.mask_for_max_buffer_model and not render_depth:
+            # masks_sel: [B, F, k, 1, H, W]
+            _masks = masks_sel.mean(dim=[3, 4, 5])  # -> [B, F, k]
+            Bm, Fm, Nm = _masks.shape
+            _masks_flat = rearrange(_masks, "b t n -> (b t) n")
+            result_mask = torch.zeros_like(_masks_flat)
+            near_full = _masks_flat >= self.mask_full_threshold
+            has_near_full = near_full.any(dim=1)
+
+            indices = near_full.float().argmax(dim=1)
+            valid_rows = torch.arange(near_full.size(0), device=_masks_flat.device)[has_near_full]
+            valid_indices = indices[has_near_full]
+            result_mask[valid_rows, valid_indices] = 1
+
+            invalid_rows = torch.arange(near_full.size(0), device=_masks_flat.device)[~has_near_full]
+            if invalid_rows.numel() > 0:
+                result_mask[invalid_rows] = 1
+            result_mask = rearrange(result_mask, "(b t) n -> b t n", b=Bm, t=Fm)
+
+            result_mask_expanded = result_mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)  # [B, F, k, 1, 1, 1]
+            pixels_sel = (pixels_sel + 1) * result_mask_expanded - 1
+            masks_sel = masks_sel * result_mask_expanded
+        return pixels_sel.to(output_device), masks_sel.to(output_device)
 
 
 class Cache4D(Cache3D_Base):
