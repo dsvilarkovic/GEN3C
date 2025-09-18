@@ -22,6 +22,8 @@ from tqdm import tqdm
 from cosmos_predict1.diffusion.conditioner import VideoExtendCondition
 from cosmos_predict1.diffusion.model.model_v2w import DiffusionV2WModel, broadcast_condition
 import torch.nn.functional as F
+from memory_utils import print_vram_usage, get_string_vram_usage
+from cosmos_predict1.utils.log import logger
 
 
 class DiffusionGen3CModel(DiffusionV2WModel):
@@ -80,11 +82,13 @@ class DiffusionGen3CModel(DiffusionV2WModel):
         gives slightly sharper results than per-channel max pooling or simple averaging.
 
         """
-
         assert condition_state.dim() == 6
         condition_state_mask = (condition_state_mask * 2 - 1).repeat(1, 1, 1, 3, 1, 1)
         latent_condition_video = []
         latent_condition_mask = []
+
+        logger.info(f"Before any latent work: {get_string_vram_usage()}")
+
 
         B, T, V, C_in, H, W = condition_state.shape
 
@@ -105,8 +109,16 @@ class DiffusionGen3CModel(DiffusionV2WModel):
             latent_condition_mask.append(current_mask_latent_B_Cl_Tl_Hl_Wl)
 
 
+        logger.info(f"{get_string_vram_usage()}")
+
+
         latent_video_B_V_Cl_Tl_Hl_Wl = torch.stack(latent_condition_video, dim=1)   # (B, V, Cl, Tl, Hl, Wl)
+
+        logger.info(f"{get_string_vram_usage()}")
+
         latent_mask_B_V_Cl_Tl_Hl_Wl = torch.stack(latent_condition_mask, dim=1)     # (B, V, Cl, Tl, Hl, Wl)
+
+        logger.info(f"{get_string_vram_usage()}")
 
         B, V, Cl, Tl, Hl, Wl = latent_video_B_V_Cl_Tl_Hl_Wl.shape
         
@@ -169,6 +181,9 @@ class DiffusionGen3CModel(DiffusionV2WModel):
             condition: Input conditions
             uncondition: Conditions removed/reduced to minimum (unconditioned)
         """
+
+
+        logger.info(f"Memory usage before getting conditions: {get_string_vram_usage()}")
         if is_negative_prompt:
             condition, uncondition = self.conditioner.get_condition_with_negative_prompt(data_batch)
         else:
@@ -182,6 +197,7 @@ class DiffusionGen3CModel(DiffusionV2WModel):
         latent_condition = self.encode_warped_frames(
             condition_state, condition_state_mask, self.tensor_kwargs["dtype"]
         )
+        logger.info(f"Memory usage after encoding warped frames: {get_string_vram_usage()}")
 
         condition.video_cond_bool = True
 
@@ -190,6 +206,10 @@ class DiffusionGen3CModel(DiffusionV2WModel):
         condition = self.add_condition_video_indicator_and_video_input_mask(
             condition_latent, condition, num_condition_t 
         )
+
+        logger.info(f"Memory usage after adding video indicator and input mask: {get_string_vram_usage()}")
+
+
         # Here we add warped latent frames as condition
         condition = self.add_condition_pose(latent_condition, condition)
 
@@ -197,9 +217,13 @@ class DiffusionGen3CModel(DiffusionV2WModel):
         uncondition = self.add_condition_video_indicator_and_video_input_mask(
             condition_latent, uncondition, num_condition_t
         )
+
+        logger.info(f"Memory usage after adding video indicator and input mask to uncondition: {get_string_vram_usage()}")
         # uncodition goes without warped frames 
         uncondition = self.add_condition_pose(latent_condition, uncondition, drop_out_latent = True)
         assert condition.gt_latent.allclose(uncondition.gt_latent)
+
+        logger.info(f"Memory usage after adding pose condition to uncondition: {get_string_vram_usage()}")
 
         # For inference, check if parallel_state is initialized
         to_cp = self.net.is_context_parallel_enabled
@@ -207,6 +231,7 @@ class DiffusionGen3CModel(DiffusionV2WModel):
             condition = broadcast_condition(condition, to_tp=False, to_cp=to_cp)
             uncondition = broadcast_condition(uncondition, to_tp=False, to_cp=to_cp)
 
+        logger.info(f"Memory usage after broadcasting conditions: {get_string_vram_usage()}")
         return condition, uncondition
 
     def add_condition_pose(self, latent_condition: torch.Tensor, condition: VideoExtendCondition,
