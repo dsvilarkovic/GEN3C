@@ -23,7 +23,7 @@ from cosmos_predict1.diffusion.inference.forward_warp_utils_pytorch import (
     unproject_points,
 )
 from cosmos_predict1.diffusion.inference.camera_utils import align_depth
-from memory_utils import print_vram_usage, get_string_vram_usage
+from cosmos_predict1.utils.memory_utils import print_vram_usage, get_string_vram_usage
 from cosmos_predict1.utils.log import logger
  
 class Cache3D_Base:

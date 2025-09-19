@@ -22,7 +22,7 @@ from tqdm import tqdm
 from cosmos_predict1.diffusion.conditioner import VideoExtendCondition
 from cosmos_predict1.diffusion.model.model_v2w import DiffusionV2WModel, broadcast_condition
 import torch.nn.functional as F
-from memory_utils import print_vram_usage, get_string_vram_usage
+from cosmos_predict1.utils.memory_utils import print_vram_usage, get_string_vram_usage
 from cosmos_predict1.utils.log import logger
 
 
